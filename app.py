@@ -4,7 +4,10 @@ import io
 import time
 import re
 from datetime import datetime
-from database import db_init, db_add_account_mapping, db_get_account_mappings, db_delete_account_mapping
+from database import (
+    db_init, db_add_account_mapping, db_get_account_mappings, db_delete_account_mapping,
+    db_add_sinpe_account_mapping, db_get_sinpe_account_mappings, db_delete_sinpe_account_mapping
+)
 
 def detect_tef_accounts(df):
     """Detect all 'TEF A: NUMBER' patterns in transaction descriptions"""
@@ -27,23 +30,69 @@ def detect_tef_accounts(df):
 
     return tef_accounts
 
-def apply_account_mappings(df, mappings):
-    """Replace 'TEF A: NUMBER' with friendly names in merchant column"""
-    def replace_tef(description):
+def detect_sinpe_accounts(df):
+    """Detect all 'SINPE A' patterns in transaction descriptions"""
+    sinpe_accounts = set()
+
+    # Look in the merchant/description column
+    merchant_col = None
+    for col in ['Merchant', 'Descripción de Transacción', 'Description']:
+        if col in df.columns:
+            merchant_col = col
+            break
+
+    if merchant_col:
+        for desc in df[merchant_col].astype(str):
+            # Look for both SINPE patterns
+            if desc.startswith('CD SINPE A ') or desc.startswith('PIN-SINPE A:'):
+                # Find the position of either pattern
+                start_idx = desc.find('CD SINPE A ')
+                if start_idx == -1:
+                    start_idx = desc.find('PIN-SINPE A:')
+
+                if start_idx != -1:
+                    # Extract everything after the pattern
+                    if desc.startswith('CD SINPE A '):
+                        sinpe_text = desc[start_idx + 11:].strip()  # "CD SINPE A " is 11 chars
+                    else:  # PIN-SINPE A:
+                        sinpe_text = desc[start_idx + 12:].strip()  # "PIN-SINPE A:" is 12 chars
+
+                    # Find the end of the SINPE account (before any additional text)
+                    end_idx = sinpe_text.find(' ')
+                    if end_idx != -1:
+                        sinpe_account = sinpe_text[:end_idx]
+                    else:
+                        sinpe_account = sinpe_text
+                    sinpe_accounts.add(sinpe_account)
+
+    return sinpe_accounts
+
+def apply_account_mappings(df, bac_mappings, sinpe_mappings):
+    """Replace 'TEF A: NUMBER' and 'SINPE A' with friendly names in merchant column"""
+    def replace_transfers(description):
         if pd.isna(description):
             return description
 
-        # More flexible pattern to handle various spacing
-        tef_pattern = r'TEF\s+A\s*:\s*(\d+)'
+        desc_str = str(description)
 
-        def replace_match(match):
+        # Replace TEF A: patterns
+        tef_pattern = r'TEF\s+A\s*:\s*(\d+)'
+        def replace_tef(match):
             account_num = match.group(1).strip()
-            if account_num in mappings:
-                return f"{mappings[account_num]} - BAC:{account_num}"
+            if account_num in bac_mappings:
+                return f"{bac_mappings[account_num]} - BAC:{account_num}"
             else:
                 return match.group(0)  # Return original if no mapping
 
-        return re.sub(tef_pattern, replace_match, str(description))
+        desc_str = re.sub(tef_pattern, replace_tef, desc_str)
+
+        # Replace SINPE A patterns - simple string replacement
+        if 'CD SINPE A ' in desc_str:
+            for sinpe_account, friendly_name in sinpe_mappings.items():
+                if sinpe_account in desc_str:
+                    desc_str = desc_str.replace(f'CD SINPE A {sinpe_account}', f'{friendly_name} - SINPE:{sinpe_account}')
+
+        return desc_str
 
     # Apply to the merchant column
     merchant_col = None
@@ -53,7 +102,7 @@ def apply_account_mappings(df, mappings):
             break
 
     if merchant_col:
-        df[merchant_col] = df[merchant_col].apply(replace_tef)
+        df[merchant_col] = df[merchant_col].apply(replace_transfers)
 
     return df
 
@@ -112,7 +161,7 @@ def parse_bac_csv(file_content):
 
     return df, len(transaction_lines)
 
-def convert_bac_to_monarch_format(df, import_id, account_mappings):
+def convert_bac_to_monarch_format(df, import_id, bac_mappings, sinpe_mappings):
     """
     Convert BAC transaction data to Monarch Money format
     Monarch Money format: Date, Merchant, Category, Account, Original Statement, Notes, Amount, Tags
@@ -121,7 +170,7 @@ def convert_bac_to_monarch_format(df, import_id, account_mappings):
         return pd.DataFrame()
 
     # Apply account mappings to replace TEF A: NUMBER with friendly names
-    df_mapped = apply_account_mappings(df.copy(), account_mappings)
+    df_mapped = apply_account_mappings(df.copy(), bac_mappings, sinpe_mappings)
 
     # Create a copy to work with
     result_df = df_mapped.copy()
@@ -276,53 +325,94 @@ def main():
                 return
 
             # ===== DETECT TEF ACCOUNTS AND SHOW MAPPING MODAL =====
-            detected_accounts = detect_tef_accounts(df)
-            current_mappings = db_get_account_mappings()
+            detected_bac_accounts = detect_tef_accounts(df)
+            detected_sinpe_accounts = detect_sinpe_accounts(df)
+            current_bac_mappings = db_get_account_mappings()
+            current_sinpe_mappings = db_get_sinpe_account_mappings()
 
-            if detected_accounts:
-                st.info(f"🏦 Found {len(detected_accounts)} TEF account(s) in your transactions")
+            if detected_bac_accounts or detected_sinpe_accounts:
+                st.info(f"🏦 Found {len(detected_bac_accounts)} BAC account(s) and {len(detected_sinpe_accounts)} SINPE account(s) in your transactions")
 
                 # Show mapping interface
-                st.write("### 🔄 BAC to BAC: Account Mapping")
-                st.write("Add a friendly name to your BAC account numbers to make your transactions easier to understand.")
-                st.write("**BAC Account → Friendly Name**")
+                st.write("### 🔄 Account Mapping")
+                st.write("Add friendly names to your account numbers to make your transactions easier to understand.")
 
-                # Create input fields for each detected account
-                for account in sorted(detected_accounts):
-                    col1, col2, col3 = st.columns([1, 2, 0.3])
+                # BAC Account Mappings
+                if detected_bac_accounts:
+                    st.write("**🏦 BAC to BAC Transfers**")
+                    for account in sorted(detected_bac_accounts):
+                        col1, col2, col3 = st.columns([1, 2, 0.3])
 
-                    with col1:
-                        st.text_input(
-                            "BAC Account",
-                            value=account,
-                            disabled=True,
-                            key=f"account_{account}",
-                            label_visibility="collapsed"
-                        )
+                        with col1:
+                            st.text_input(
+                                "BAC Account",
+                                value=account,
+                                disabled=True,
+                                key=f"bac_account_{account}",
+                                label_visibility="collapsed"
+                            )
 
-                    with col2:
-                        # Pre-fill with existing mapping if available
-                        default_value = current_mappings.get(account, "")
-                        friendly_name = st.text_input(
-                            "Friendly Name",
-                            value=default_value,
-                            placeholder="e.g., Mom, John Doe, Sister Maria",
-                            key=f"name_{account}",
-                            label_visibility="collapsed"
-                        )
+                        with col2:
+                            # Pre-fill with existing mapping if available
+                            default_value = current_bac_mappings.get(account, "")
+                            friendly_name = st.text_input(
+                                "Friendly Name",
+                                value=default_value,
+                                placeholder="e.g., Mom, John Doe, Sister Maria",
+                                key=f"bac_name_{account}",
+                                label_visibility="collapsed"
+                            )
 
-                    with col3:
-                        if st.button("📋", key=f"copy_{account}", help="Copy account number"):
-                            st.rerun()
+                        with col3:
+                            if st.button("📋", key=f"bac_copy_{account}", help="Copy account number"):
+                                st.rerun()
+
+                # SINPE Account Mappings
+                if detected_sinpe_accounts:
+                    st.write("**💳 SINPE Transfers (Bank to Bank)**")
+                    for account in sorted(detected_sinpe_accounts):
+                        col1, col2, col3 = st.columns([1, 2, 0.3])
+
+                        with col1:
+                            st.text_input(
+                                "SINPE Account",
+                                value=account,
+                                disabled=True,
+                                key=f"sinpe_account_{account}",
+                                label_visibility="collapsed"
+                            )
+
+                        with col2:
+                            # Pre-fill with existing mapping if available
+                            default_value = current_sinpe_mappings.get(account, "")
+                            friendly_name = st.text_input(
+                                "Friendly Name",
+                                value=default_value,
+                                placeholder="e.g., Mom, John Doe, Sister Maria",
+                                key=f"sinpe_name_{account}",
+                                label_visibility="collapsed"
+                            )
+
+                        with col3:
+                            if st.button("📋", key=f"sinpe_copy_{account}", help="Copy account number"):
+                                st.rerun()
 
                 # Check for changes and auto-save
-                for account in sorted(detected_accounts):
-                    current_value = st.session_state.get(f"name_{account}", "")
-                    if current_value.strip() and current_value != current_mappings.get(account, ""):
+                for account in sorted(detected_bac_accounts):
+                    current_value = st.session_state.get(f"bac_name_{account}", "")
+                    if current_value.strip() and current_value != current_bac_mappings.get(account, ""):
                         db_add_account_mapping(account, current_value.strip())
-                        if f"auto_saved_{account}" not in st.session_state:
-                            st.success(f"✅ Auto-saved mapping for {account}")
-                            st.session_state[f"auto_saved_{account}"] = True
+                        if f"bac_auto_saved_{account}" not in st.session_state:
+                            st.success(f"✅ Auto-saved BAC mapping for {account}")
+                            st.session_state[f"bac_auto_saved_{account}"] = True
+
+                for account in sorted(detected_sinpe_accounts):
+                    current_value = st.session_state.get(f"sinpe_name_{account}", "")
+                    if current_value.strip() and current_value != current_sinpe_mappings.get(account, ""):
+                        db_add_sinpe_account_mapping(account, current_value.strip())
+                        if f"sinpe_auto_saved_{account}" not in st.session_state:
+                            st.success(f"✅ Auto-saved SINPE mapping for {account}")
+                            st.session_state[f"sinpe_auto_saved_{account}"] = True
 
                 # Proceed button
                 if st.button("➡️ Continue to Conversion", type="primary"):
@@ -331,7 +421,7 @@ def main():
                     st.rerun()
 
             else:
-                # No TEF accounts detected, proceed normally
+                # No accounts detected, proceed normally
                 st.session_state.mapping_complete = True
                 st.session_state.use_mappings = True
 
@@ -339,12 +429,14 @@ def main():
             if st.session_state.get('mapping_complete', False):
                 # Get final mappings based on user choice
                 if st.session_state.get('use_mappings', True):
-                    final_mappings = db_get_account_mappings()
+                    final_bac_mappings = db_get_account_mappings()
+                    final_sinpe_mappings = db_get_sinpe_account_mappings()
                 else:
-                    final_mappings = {}  # Empty mappings = keep original format
+                    final_bac_mappings = {}  # Empty mappings = keep original format
+                    final_sinpe_mappings = {}
 
                 # Convert to Monarch Money format
-                result_df = convert_bac_to_monarch_format(df, import_id, final_mappings)
+                result_df = convert_bac_to_monarch_format(df, import_id, final_bac_mappings, final_sinpe_mappings)
 
                 if not result_df.empty:
                     st.write("### 💰 Converted Data Preview (Monarch Money Format):")
@@ -353,15 +445,25 @@ def main():
                     st.write(f"✅ Successfully converted {len(result_df)} transactions")
 
                     # Show mapping results
-                    if detected_accounts and final_mappings:
-                        mapped_count = len([acc for acc in detected_accounts if acc in final_mappings])
-                        st.info(f"🔄 {mapped_count} of {len(detected_accounts)} TEF accounts mapped to friendly names")
+                    if detected_bac_accounts and final_bac_mappings:
+                        mapped_count = len([acc for acc in detected_bac_accounts if acc in final_bac_mappings])
+                        st.info(f"🔄 {mapped_count} of {len(detected_bac_accounts)} BAC accounts mapped to friendly names")
 
                         # Show sample mapped transactions
-                        tef_transactions = result_df[result_df['Merchant'].str.contains('Transfer to.*- BAC:', na=False)]
-                        if not tef_transactions.empty:
-                            st.write("### 🔄 Sample Mapped TEF Transactions:")
-                            st.dataframe(tef_transactions[['Date', 'Merchant', 'Amount']].head(5))
+                        bac_transactions = result_df[result_df['Merchant'].str.contains('Transfer to.*- BAC:', na=False)]
+                        if not bac_transactions.empty:
+                            st.write("### 🔄 Sample Mapped BAC Transactions:")
+                            st.dataframe(bac_transactions[['Date', 'Merchant', 'Amount']].head(5))
+
+                    if detected_sinpe_accounts and final_sinpe_mappings:
+                        mapped_count = len([acc for acc in detected_sinpe_accounts if acc in final_sinpe_mappings])
+                        st.info(f"🔄 {mapped_count} of {len(detected_sinpe_accounts)} SINPE accounts mapped to friendly names")
+
+                        # Show sample mapped transactions
+                        sinpe_transactions = result_df[result_df['Merchant'].str.contains('Transfer to.*- SINPE:', na=False)]
+                        if not sinpe_transactions.empty:
+                            st.write("### 🔄 Sample Mapped SINPE Transactions:")
+                            st.dataframe(sinpe_transactions[['Date', 'Merchant', 'Amount']].head(5))
 
                     # Download button - NO HEADERS as required by Monarch Money
                     csv = result_df.to_csv(index=False, header=False)
